@@ -133,6 +133,7 @@ typedef struct {
     uint8_t  cmd_sel;
     uint8_t  cmd_scroll;
     uint8_t  ap_cursor;
+    uint8_t  selected_ch;
     uint8_t  view_mode;
     bool     stay_active;
 
@@ -149,7 +150,10 @@ typedef struct {
 
     uint32_t last_display_ms;
     uint32_t start_ms;
+    uint32_t prompt_ms;
     bool     display_dirty;
+
+    char     target_ssid[18];
 
     compact_ap_t aps[MAX_APS];
     char     gen_lines[GEN_LINES][GEN_LINE_LEN];
@@ -331,9 +335,10 @@ static void show_ap_table(ghost_state_t *s) {
             compact_ap_t *ap = &s->aps[idx];
             const char *ssid = ap->ssid[0] ? ap->ssid : "?";
             char marker = (idx == s->ap_cursor) ? '>' : ' ';
+            const char *band = ap->channel >= 36 ? "5G" : ap->security;
             snprintf(lb[n], 36, "%c%2d %-12.12s %2d %3d %s",
                      marker, idx, ssid,
-                     ap->channel, ap->rssi, ap->security);
+                     ap->channel, ap->rssi, band);
             lp[n] = lb[n];
             n++;
         }
@@ -392,8 +397,10 @@ static void process_line(ghost_state_t *s, char *line) {
             gen_add_line(s, p);
         }
 
-        if (strstr(p, "ghost>") && strlen(p) < 10)
+        if (strstr(p, "ghost>") && strlen(p) < 10) {
             s->got_prompt = true;
+            s->prompt_ms = to_ms_since_boot(get_absolute_time());
+        }
     }
 }
 
@@ -419,10 +426,12 @@ static void send_ghost_cmd(ghost_state_t *s, const char *cmd) {
     s->got_prompt = false;
     s->last_display_ms = to_ms_since_boot(get_absolute_time());
 
-    tool_orca_raw_mode = true;
-    tool_orca_raw_flush();
-    tool_orca_raw_send("\r\n");
-    sleep_ms(50);
+    if (!tool_orca_raw_mode) {
+        tool_orca_raw_mode = true;
+        tool_orca_raw_flush();
+        tool_orca_raw_send("\r\n");
+        sleep_ms(50);
+    }
     tool_orca_raw_flush();
     tool_orca_raw_send(cmd);
     tool_orca_raw_send("\r\n");
@@ -457,6 +466,12 @@ static tool_result_t ghost_enter(tool_ctx_t *ctx) {
 static tool_result_t ghost_update(tool_ctx_t *ctx) {
     ghost_state_t *s = (ghost_state_t *)ctx->state;
 
+    if (tool_orca_raw_mode && s->mode != MODE_OUTPUT) {
+        uint8_t drain[64];
+        tool_orca_raw_read(drain, sizeof(drain));
+        return TOOL_OK;
+    }
+
     if (s->mode != MODE_OUTPUT) return TOOL_OK;
 
     uint8_t buf[128];
@@ -471,7 +486,6 @@ static tool_result_t ghost_update(tool_ctx_t *ctx) {
             s->mode = MODE_AP_TABLE;
             s->out_scroll = 0;
             s->ap_cursor = 0;
-            tool_orca_raw_mode = false;
             tool_send_status_bar("Scan Results");
             show_ap_table(s);
             return TOOL_OK;
@@ -488,7 +502,6 @@ static tool_result_t ghost_update(tool_ctx_t *ctx) {
             s->mode = MODE_AP_TABLE;
             s->out_scroll = 0;
             s->ap_cursor = 0;
-            tool_orca_raw_mode = false;
             tool_send_status_bar("Scan Results");
             show_ap_table(s);
         }
@@ -498,6 +511,21 @@ static tool_result_t ghost_update(tool_ctx_t *ctx) {
             s->display_dirty = false;
             s->out_scroll = s->out_count > 13 ? s->out_count - 13 : 0;
             show_generic_output(s);
+        }
+
+        if (s->stay_active && s->got_prompt
+            && now - s->prompt_ms > 1500) {
+            tool_orca_raw_mode = false;
+            if (s->ap_count > 0) {
+                s->mode = MODE_AP_TABLE;
+                s->out_scroll = 0;
+                tool_send_status_bar("Scan Results");
+                show_ap_table(s);
+            } else {
+                s->mode = MODE_COMMANDS;
+                tool_send_status_bar(categories[s->cat_sel].name);
+                show_commands(s);
+            }
         }
     }
 
@@ -559,8 +587,79 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
             break;
         case IPP_BTN_GREEN: {
             const ghost_cmd_t *cmd = &cat->cmds[s->cmd_sel];
+            if (strstr(cmd->cmd, "attack") && s->selected_ch >= 36) {
+                tool_send_toast("Deauth requires 2.4 GHz", 2000);
+                if (s->ap_count > 0) {
+                    s->mode = MODE_AP_TABLE;
+                    s->out_scroll = 0;
+                    tool_send_status_bar("Scan Results");
+                    show_ap_table(s);
+                }
+                break;
+            }
             if (cmd->flags == CMD_WIFI_SCAN) {
                 start_wifi_scan(s);
+            } else if (s->target_ssid[0] && strstr(cmd->cmd, "attack")) {
+                tool_send_status_bar("Targeting...");
+
+                s->view_mode = VIEW_SCANNING;
+                s->ap_count = 0;
+                s->parse_idx = -1;
+                s->scan_done = false;
+                s->got_prompt = false;
+                s->out_count = 0;
+                s->line_pos = 0;
+                memset(s->aps, 0, sizeof(s->aps));
+
+                send_ghost_cmd(s, "scanap 5");
+
+                uint32_t t0 = to_ms_since_boot(get_absolute_time());
+                while (to_ms_since_boot(get_absolute_time()) - t0 < 10000) {
+                    uint8_t rb[128];
+                    uint16_t nr = tool_orca_raw_read(rb, sizeof(rb));
+                    for (uint16_t ri = 0; ri < nr; ri++)
+                        feed_byte(s, rb[ri]);
+                    if (s->got_prompt && s->scan_done) break;
+                    sleep_ms(20);
+                }
+
+                int8_t match = -1;
+                for (uint8_t i = 0; i < s->ap_count; i++) {
+                    if (strcmp(s->aps[i].ssid, s->target_ssid) == 0) {
+                        match = i;
+                        break;
+                    }
+                }
+
+                if (match >= 0) {
+                    char sel[32];
+                    snprintf(sel, sizeof(sel), "select -a %d", match);
+                    s->out_count = 0;
+                    s->line_pos = 0;
+                    s->got_prompt = false;
+                    tool_orca_raw_flush();
+                    tool_orca_raw_send(sel);
+                    tool_orca_raw_send("\r\n");
+                    sleep_ms(300);
+                    tool_orca_raw_flush();
+
+                    s->selected_ch = s->aps[match].channel;
+                    s->ap_cursor = match;
+                }
+
+                s->view_mode = VIEW_GENERIC;
+                s->out_count = 0;
+                s->out_scroll = 0;
+                s->line_pos = 0;
+                s->got_prompt = false;
+                s->display_dirty = true;
+                s->mode = MODE_OUTPUT;
+                s->stay_active = true;
+                tool_send_status_bar(cmd->label);
+                tool_orca_raw_flush();
+                tool_orca_raw_send(cmd->cmd);
+                tool_orca_raw_send("\r\n");
+                show_generic_output(s);
             } else {
                 s->mode = MODE_OUTPUT;
                 s->view_mode = VIEW_GENERIC;
@@ -572,6 +671,8 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
             break;
         }
         case IPP_BTN_RED:
+            tool_orca_raw_mode = false;
+            tool_orca_raw_flush();
             s->mode = MODE_CATEGORIES;
             tool_send_status_bar("GhostESP");
             show_categories(s);
@@ -601,7 +702,6 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
                 s->mode = MODE_AP_TABLE;
                 s->out_scroll = 0;
                 s->ap_cursor = 0;
-                tool_orca_raw_mode = false;
                 tool_send_status_bar("Scan Results");
                 show_ap_table(s);
             } else {
@@ -655,22 +755,13 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
             break;
         case IPP_BTN_GREEN:
             if (s->ap_count > 0) {
-                char sel_cmd[32];
-                snprintf(sel_cmd, sizeof(sel_cmd),
-                         "select -a %u\r\n", s->ap_cursor);
-                tool_orca_raw_mode = true;
-                tool_orca_raw_flush();
-                tool_orca_raw_send(sel_cmd);
-                sleep_ms(200);
-                tool_orca_raw_mode = false;
-                tool_orca_raw_flush();
-
                 compact_ap_t *ap = &s->aps[s->ap_cursor];
+                s->selected_ch = ap->channel;
+                memcpy(s->target_ssid, ap->ssid, 18);
                 char toast[36];
                 snprintf(toast, sizeof(toast), "Target: %s",
                          ap->ssid[0] ? ap->ssid : "?");
                 tool_send_toast(toast, 2000);
-
                 s->cat_sel = 0;
                 s->cmd_sel = 1;
                 s->cmd_scroll = 0;
@@ -680,6 +771,8 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
             }
             break;
         case IPP_BTN_RED:
+            tool_orca_raw_mode = false;
+            tool_orca_raw_flush();
             s->mode = MODE_COMMANDS;
             tool_send_status_bar(categories[s->cat_sel].name);
             show_commands(s);
@@ -692,28 +785,26 @@ static tool_result_t ghost_on_button(tool_ctx_t *ctx,
 }
 
 static void ghost_exit(tool_ctx_t *ctx) {
-    ghost_state_t *s = (ghost_state_t *)ctx->state;
-    if (s->mode == MODE_OUTPUT || s->mode == MODE_AP_TABLE) {
-        tool_orca_raw_mode = true;
-        tool_orca_raw_send("\x03\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("stopscan\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("stopdeauth\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("blespam -s\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("blescan -s\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("stopspam\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("stopsaeflood\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("dhcpstarve stop\r\n");
-        sleep_ms(50);
-        tool_orca_raw_send("wdstream stop\r\n");
-        sleep_ms(100);
-    }
+    (void)ctx;
+    tool_orca_raw_mode = true;
+    tool_orca_raw_send("\x03\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("stopscan\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("stopdeauth\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("blespam -s\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("blescan -s\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("stopspam\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("stopsaeflood\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("dhcpstarve stop\r\n");
+    sleep_ms(50);
+    tool_orca_raw_send("wdstream stop\r\n");
+    sleep_ms(100);
     tool_orca_raw_mode = false;
     tool_orca_raw_flush();
 }
