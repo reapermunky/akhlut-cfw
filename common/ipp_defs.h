@@ -57,6 +57,7 @@
 #define IPP_MSG_I2C_SCAN_REQ   0x1C    // Request Display to scan its local I2C bus
 #define IPP_MSG_IOEXP_WRITE    0x1D    // Write PCA9555 register: {reg, value}
 #define IPP_MSG_IOEXP_READ     0x1E    // Read PCA9555 register: {reg}
+#define IPP_MSG_ACCEL_REQ      0x1F    // Request accelerometer data from Display
 
 /* ──────────────────────────────────────────────────────────
  * Message Types — Display → Main (0x81–0xBF)
@@ -216,6 +217,14 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  brightness;  // 0-255
 } ipp_backlight_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t cx;
+    uint16_t cy;
+    uint16_t r;
+    uint16_t color;       // RGB565
+    uint8_t  filled;      // 0 = outline, 1 = filled
+} ipp_draw_circle_t;
 
 /* ──────────────────────────────────────────────────────────
  * Payload Structures — Main → Display: Status Bar
