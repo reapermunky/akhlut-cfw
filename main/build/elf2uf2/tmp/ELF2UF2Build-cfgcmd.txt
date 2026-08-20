@@ -1,0 +1,1 @@
+cmd='C:/Strawberry/c/bin/cmake.exe;-DCMAKE_MAKE_PROGRAM:FILEPATH=C:/Strawberry/c/bin/ninja.exe;-GNinja;-S;<SOURCE_DIR><SOURCE_SUBDIR>;-B;<BINARY_DIR>'
