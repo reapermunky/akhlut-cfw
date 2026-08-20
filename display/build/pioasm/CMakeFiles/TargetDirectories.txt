@@ -1,0 +1,3 @@
+C:/Users/ch4zi/Desktop/free wili/akhlut/display/build/pioasm/CMakeFiles/pioasm.dir
+C:/Users/ch4zi/Desktop/free wili/akhlut/display/build/pioasm/CMakeFiles/edit_cache.dir
+C:/Users/ch4zi/Desktop/free wili/akhlut/display/build/pioasm/CMakeFiles/rebuild_cache.dir
