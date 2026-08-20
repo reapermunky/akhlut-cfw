@@ -63,6 +63,8 @@
 #define CC1101_STATUS_RSSI       0x34
 #define CC1101_STATUS_MARCSTATE  0x35
 #define CC1101_STATUS_TXBYTES   0x3A
+#define CC1101_STATUS_RXBYTES   0x3B
+#define CC1101_RXFIFO           0x3F
 
 /* MARCSTATE values */
 #define MARCSTATE_IDLE    0x01
@@ -88,5 +90,7 @@ void    cc1101_rx(uint8_t cs);
 void    cc1101_flush_tx(uint8_t cs);
 void    cc1101_write_patable(uint8_t cs, const uint8_t *table, uint8_t len);
 void    cc1101_tx(uint8_t cs, const uint8_t *data, uint16_t len);
+void    cc1101_flush_rx(uint8_t cs);
+int     cc1101_rx_read(uint8_t cs, uint8_t *buf, uint8_t max_len);
 
 #endif

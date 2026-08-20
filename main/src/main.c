@@ -83,24 +83,28 @@ static bool safe_mode = false;
 static bool display_ready = false;
 
 // Battery state (updated from Display via IPP_MSG_BATTERY_DATA)
-static volatile uint8_t  battery_pct = 0;
+volatile uint8_t  battery_pct = 0;
 static volatile bool     battery_charging = false;
 static volatile bool     battery_dirty = false;
-static volatile uint16_t battery_vbatt_mv = 0;
+volatile uint16_t battery_vbatt_mv = 0;
 static volatile uint16_t battery_vbus_mv = 0;
 static volatile uint16_t battery_ichg_ma = 0;
-static volatile uint8_t  battery_flags_raw = 0;
+volatile uint8_t  battery_flags_raw = 0;
 
 // IR received pending buffer (Display→Main)
-static volatile bool        ir_pending = false;
-static volatile ipp_ir_code_t ir_pending_code;
+volatile bool        ir_pending = false;
+volatile ipp_ir_code_t ir_pending_code;
 static volatile bool        i2c_scan_pending = false;
 static ipp_i2c_scan_resp_t  i2c_scan_resp_buf;
 
-static volatile bool        ioexp_resp_pending = false;
-static volatile uint8_t     ioexp_resp_reg;
-static volatile uint8_t     ioexp_resp_val;
-static volatile uint8_t     ioexp_resp_status;
+volatile bool        ioexp_resp_pending = false;
+volatile uint8_t     ioexp_resp_reg;
+volatile uint8_t     ioexp_resp_val;
+volatile uint8_t     ioexp_resp_status;
+
+// Accelerometer data (Display→Main, cached)
+volatile bool           accel_data_valid = false;
+volatile ipp_accel_data_t accel_last;
 
 // Menu state
 static uint8_t menu_selected = 0;
@@ -247,6 +251,19 @@ static void __not_in_flash_func(on_display_frame)(const ipp_frame_t *frame, void
             battery_vbus_mv = bat->vbus_mv;
             battery_ichg_ma = bat->ichg_ma;
             battery_flags_raw = bat->flags;
+        }
+        break;
+
+    case IPP_MSG_ACCEL_DATA:
+        if (frame->length >= sizeof(ipp_accel_data_t)) {
+            const ipp_accel_data_t *acc =
+                (const ipp_accel_data_t *)frame->payload;
+            accel_last.x = acc->x;
+            accel_last.y = acc->y;
+            accel_last.z = acc->z;
+            accel_last.g_total = acc->g_total;
+            accel_last.temp_c_x10 = acc->temp_c_x10;
+            accel_data_valid = true;
         }
         break;
 

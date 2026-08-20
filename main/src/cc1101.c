@@ -143,3 +143,25 @@ void cc1101_tx(uint8_t cs, const uint8_t *data, uint16_t len) {
     sleep_us(1000);
     cc1101_idle(cs);
 }
+
+void cc1101_flush_rx(uint8_t cs) {
+    cc1101_strobe(cs, CC1101_CMD_SFRX);
+}
+
+int cc1101_rx_read(uint8_t cs, uint8_t *buf, uint8_t max_len) {
+    uint8_t rxbytes = cc1101_read_status(cs, CC1101_STATUS_RXBYTES) & 0x7F;
+    if (rxbytes == 0) return 0;
+    if (rxbytes > max_len) rxbytes = max_len;
+
+    gpio_put(cs, 0);
+    sleep_us(1);
+    uint8_t hdr = CC1101_RXFIFO | 0xC0;
+    spi_write_blocking(RADIO_SPI, &hdr, 1);
+    spi_read_blocking(RADIO_SPI, 0x00, buf, rxbytes);
+    gpio_put(cs, 1);
+
+    cc1101_flush_rx(cs);
+    cc1101_rx(cs);
+
+    return (int)rxbytes;
+}
