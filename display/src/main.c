@@ -49,6 +49,7 @@ static void process_pending_messages(void);
 
 static void __not_in_flash_func(uart0_irq_handler)(void);
 static void __not_in_flash_func(on_main_frame)(const ipp_frame_t *frame, void *user_data);
+static void read_and_send_accel(void);
 
 /* ──────────────────────────────────────────────────────────
  * Global State
@@ -89,7 +90,7 @@ static volatile bool     pend_clear;
 
 // Draw command ring buffer (ISR producer, main loop consumer)
 #define DRAW_Q_DEPTH 32
-#define DRAW_Q_PAYLOAD 64
+#define DRAW_Q_PAYLOAD 256
 
 typedef struct {
     uint8_t type;
@@ -112,6 +113,7 @@ static volatile uint8_t  pend_ioexp_reg;
 static volatile uint8_t  pend_ioexp_val;
 static volatile bool     pend_ioexp_read;
 static volatile uint8_t  pend_ioexp_read_reg;
+static volatile bool     pend_accel_req;
 
 // Buttons
 typedef struct {
@@ -290,6 +292,10 @@ static void __not_in_flash_func(on_main_frame)(const ipp_frame_t *frame, void *u
     }
     case IPP_MSG_DRAW_CIRCLE:
     case IPP_MSG_DRAW_BATCH:
+        break;
+
+    case IPP_MSG_ACCEL_REQ:
+        pend_accel_req = true;
         break;
 
     default:
@@ -498,6 +504,54 @@ static void process_pending_messages(void) {
 }
 
 /* ──────────────────────────────────────────────────────────
+ * LIS3DH Accelerometer Read + Send
+ * ────────────────────────────────────────────────────────── */
+static void read_and_send_accel(void) {
+    if (!accel_present) return;
+
+    uint8_t reg = 0x28 | 0x80;  // OUT_X_L with auto-increment
+    uint8_t raw[6];
+    int ret = i2c_write_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, &reg, 1, true);
+    if (ret < 0) return;
+    ret = i2c_read_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, raw, 6, false);
+    if (ret < 0) return;
+
+    ipp_accel_data_t acc;
+    int16_t raw_x = (int16_t)(raw[1] << 8 | raw[0]) >> 4;
+    int16_t raw_y = (int16_t)(raw[3] << 8 | raw[2]) >> 4;
+    int16_t raw_z = (int16_t)(raw[5] << 8 | raw[4]) >> 4;
+
+    // +/-4g high-res 12-bit: 1 LSB = 2mg
+    acc.x = raw_x * 2;
+    acc.y = raw_y * 2;
+    acc.z = raw_z * 2;
+
+    // Magnitude via integer sqrt
+    uint32_t sum = (uint32_t)((int32_t)acc.x * acc.x +
+                              (int32_t)acc.y * acc.y +
+                              (int32_t)acc.z * acc.z);
+    uint32_t g = 0, bit = 1u << 30;
+    while (bit > sum) bit >>= 2;
+    while (bit) {
+        if (sum >= g + bit) { sum -= g + bit; g = (g >> 1) + bit; }
+        else g >>= 1;
+        bit >>= 2;
+    }
+    acc.g_total = (uint16_t)g;
+
+    // Temperature: OUT_TEMP_L (0x0C/0x0D), relative to 25C
+    uint8_t treg = 0x0C | 0x80;
+    uint8_t traw[2] = {0, 0};
+    ret = i2c_write_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, &treg, 1, true);
+    if (ret >= 0)
+        i2c_read_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, traw, 2, false);
+    int16_t temp_raw = (int16_t)(traw[1] << 8 | traw[0]) >> 6;
+    acc.temp_c_x10 = (temp_raw + 25) * 10;
+
+    ipp_send_main(IPP_MSG_ACCEL_DATA, &acc, sizeof(acc));
+}
+
+/* ──────────────────────────────────────────────────────────
  * Button Init + Scanning
  * ────────────────────────────────────────────────────────── */
 static void init_buttons(void) {
@@ -660,6 +714,18 @@ static void init_i2c_sensors(void) {
 
     ret = i2c_read_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, &dummy, 1, false);
     accel_present = (ret >= 0);
+
+    if (accel_present) {
+        // CTRL_REG1 (0x20): 100Hz ODR, all axes enabled
+        uint8_t cmd1[2] = { 0x20, 0x57 };
+        i2c_write_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, cmd1, 2, false);
+        // CTRL_REG4 (0x23): BDU=1, +/-4g, high resolution mode
+        uint8_t cmd4[2] = { 0x23, 0x98 };
+        i2c_write_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, cmd4, 2, false);
+        // TEMP_CFG_REG (0x1F): enable ADC + temperature sensor
+        uint8_t cmdt[2] = { 0x1F, 0xC0 };
+        i2c_write_blocking(LOCAL_I2C, I2C_ADDR_ACCEL, cmdt, 2, false);
+    }
 
     ret = i2c_read_blocking(LOCAL_I2C, I2C_ADDR_IOEXP, &dummy, 1, false);
     ioexp_present = (ret >= 0);
@@ -844,6 +910,7 @@ int main(void) {
     // Event Loop (Core 0)
     uint32_t last_button_scan = 0;
     uint32_t last_sensor_poll = 0;
+    uint32_t last_accel_poll = 0;
 
     while (true) {
         if (pend_reboot_bootloader) {
@@ -933,6 +1000,18 @@ int main(void) {
                 ui_menu_draw(&ui_menu);
             }
             ui_hint_bar_draw(&ui_hb);
+        }
+
+        // Accelerometer: respond to on-demand request
+        if (pend_accel_req) {
+            pend_accel_req = false;
+            read_and_send_accel();
+        }
+
+        // Poll accelerometer every ~50ms (20 Hz)
+        if (now - last_accel_poll >= 50) {
+            read_and_send_accel();
+            last_accel_poll = now;
         }
 
         // Poll sensors every ~1000ms
